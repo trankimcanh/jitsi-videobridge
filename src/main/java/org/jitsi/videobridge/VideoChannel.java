@@ -111,6 +111,17 @@ public class VideoChannel
     private static RecurringRunnableExecutor recurringExecutor;
 
     /**
+     * Configuration property for number of streams to cache
+     */
+    public final static String ENABLE_LIPSYNC_HACK_PNAME
+        = VideoChannel.class.getName() + ".ENABLE_LIPSYNC_HACK";
+
+    /**
+     * The object that implements a hack for LS for this {@link Endpoint}.
+     */
+    private final LipSyncHack lipSyncHack;
+
+    /**
      * @return the {@link RecurringRunnableExecutor} instance for
      * {@link VideoChannel}s. Uses lazy initialization.
      */
@@ -268,11 +279,16 @@ public class VideoChannel
                     classLogger,
                     content.getConference().getLogger());
 
-        initializeTransformerEngine();
-
         ConfigurationService cfg
             = content.getConference().getVideobridge()
-                        .getConfigurationService();
+            .getConfigurationService();
+
+        this.lipSyncHack
+            = cfg != null && cfg.getBoolean(ENABLE_LIPSYNC_HACK_PNAME, true)
+            ? new LipSyncHack(this) : null;
+
+        initializeTransformerEngine();
+
         requestRetransmissions
             = cfg != null
                 && cfg.getBoolean(
@@ -387,6 +403,18 @@ public class VideoChannel
         }
 
         return accept;
+    }
+
+    /**
+     * Gets the object that implements a hack for LS for this
+     * {@link VideoChannel}.
+     *
+     * @return the object that implements a hack for LS for this
+     * {@link VideoChannel}.
+     */
+    public LipSyncHack getLipSyncHack()
+    {
+        return lipSyncHack;
     }
 
     /**
@@ -548,7 +576,7 @@ public class VideoChannel
      * <tt>false</tt>. The implementation of the <tt>RtpChannel</tt> class
      * always returns <tt>true</tt>.
      */
-    public boolean isInLastN(Channel channel)
+    public boolean isInLastN(RtpChannel channel)
     {
         return lastNController.isForwarded(channel);
     }
@@ -562,7 +590,7 @@ public class VideoChannel
 
         if (Endpoint.PINNED_ENDPOINTS_PROPERTY_NAME.equals(propertyName))
         {
-            lastNController.setPinnedEndpointIds((List<String>)ev.getNewValue());
+            lastNController.setPinnedEndpointIds((Set<String>)ev.getNewValue());
         }
     }
 
@@ -573,12 +601,9 @@ public class VideoChannel
     boolean rtpTranslatorWillWrite(
         boolean data,
         byte[] buffer, int offset, int length,
-        Channel source)
+        RtpChannel source)
     {
-        // XXX(gp) we could potentially move this into a TransformEngine.
         boolean accept = lastNController.isForwarded(source);
-
-        LipSyncHack lipSyncHack = getEndpoint().getLipSyncHack();
 
         if (lipSyncHack != null)
         {
@@ -890,39 +915,71 @@ public class VideoChannel
 
         RawPacketCache cache;
         RtxTransformer rtxTransformer;
+        MediaStream stream = getStream();
 
-        if ((cache = getStream().getPacketCache()) != null
+        if (stream != null && (cache = stream.getPacketCache()) != null
                 && (rtxTransformer = transformEngine.getRtxTransformer())
                         != null)
         {
             // XXX The retransmission of packets MUST take into account SSRC
             // rewriting. Which it may do by injecting retransmitted packets
-            // AFTER the SsrcRewritingEngine. Since the retransmitted packets
-            // have been cached by cache and cache is a TransformEngine, the
-            // injection may as well happen after cache.
+            // AFTER the SsrcRewritingEngine.
+            // Also, the cache MUST be notified of packets being retransmitted,
+            // in order for it to update their timestamp. We do this here by
+            // simply letting retransmitted packets pass through the cache again.
+            // We use the retransmission requester here simply because it is
+            // the transformer right before the cache, not because of anything
+            // intrinsic to it.
+            RetransmissionRequester rr = stream.getRetransmissionRequester();
             TransformEngine after
-                = (cache instanceof TransformEngine)
-                    ? (TransformEngine) cache
-                    : null;
+                = (rr instanceof TransformEngine) ? (TransformEngine) rr : null;
+
+            long rtt = getStream().getMediaStreamStats().getSendStats().getRtt();
+            long now = System.currentTimeMillis();
 
             for (Iterator<Integer> i = lostPackets.iterator(); i.hasNext();)
             {
                 int seq = i.next();
-                RawPacket pkt = cache.get(ssrc, seq);
+                RawPacketCache.Container container
+                    = cache.getContainer(ssrc, seq);
 
-                if (pkt != null)
+
+                if (container != null)
                 {
+                    // Cache hit.
+                    long delay = now - container.timeAdded;
+                    boolean send = (rtt == -1) ||
+                        (delay >= Math.min(rtt * 0.9, rtt - 5));
+
                     if (logger.isDebugEnabled())
                     {
                         logger.debug(Logger.Category.STATISTICS,
                                      "retransmitting," + getLoggingId()
                                      + " ssrc=" + ssrc
-                                     + ",seq=" + seq);
+                                     + ",seq=" + seq
+                                     + ",send=" + send);
                     }
-                    if (rtxTransformer.retransmit(pkt, after))
+
+                    if (send && rtxTransformer.retransmit(container.pkt, after))
                     {
+                        statistics.packetsRetransmitted.incrementAndGet();
+                        statistics.bytesRetransmitted.addAndGet(
+                            container.pkt.getLength());
                         i.remove();
                     }
+
+                    if (!send)
+                    {
+                        statistics.packetsNotRetransmitted.incrementAndGet();
+                        statistics.bytesNotRetransmitted.addAndGet(
+                            container.pkt.getLength());
+                        i.remove();
+                    }
+
+                }
+                else
+                {
+                    statistics.packetsMissingFromCache.incrementAndGet();
                 }
             }
         }
@@ -1070,36 +1127,6 @@ public class VideoChannel
         if (simulcastTriplets == null || simulcastTriplets.length == 0)
         {
             return;
-        }
-
-        // FID groups have been saved in RtpChannel. Make sure any changes are
-        // propagated to the appropriate SimulcastStream-s.
-        synchronized (fidSourceGroups)
-        {
-            if (!fidSourceGroups.isEmpty())
-            {
-                for (Map.Entry<Long, Long> entry : this.fidSourceGroups
-                    .entrySet())
-                {
-                    if (entry.getKey() == null || entry.getValue() == null)
-                    {
-                        continue;
-                    }
-
-                    // autoboxing.
-                    long primarySSRC = entry.getKey();
-                    long fidSSRC = entry.getValue();
-
-                    for (int i = 0; i < simulcastTriplets.length; i++)
-                    {
-                        if (simulcastTriplets[i][0] == primarySSRC)
-                        {
-                            simulcastTriplets[i][1] = fidSSRC;
-                            break;
-                        }
-                    }
-                }
-            }
         }
 
         SimulcastStream[] simulcastStreams
@@ -1362,7 +1389,10 @@ public class VideoChannel
                            "sending_bitrate," + getLoggingId()
                            + " bwe=" + bwe
                            + ",sbr=" + sendingBitrate
-                           + ",loss=" + lossRate);
+                           + ",loss=" + lossRate
+                           + ",remb=" + bandwidthEstimator.getLatestREMB()
+                           + ",rrLoss="
+                               + bandwidthEstimator.getLatestFractionLoss());
             }
         };
     }
